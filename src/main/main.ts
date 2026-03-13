@@ -27,15 +27,15 @@ import {
   readAllowFromStore,
 } from './im/imPairingStore';
 import { OpenClawConfigSync } from './libs/openclawConfigSync';
-import { OpenClawChannelSessionSync } from './libs/openclawChannelSessionSync';
+import { OpenClawChannelSessionSync, parseChannelSessionKey, CHANNEL_PLATFORM_MAP } from './libs/openclawChannelSessionSync';
 import { IMGatewayManager, IMPlatform, IMGatewayConfig } from './im';
 import { APP_NAME } from './appConstants';
 import { getSkillServiceManager } from './skillServices';
 import { createTray, destroyTray, updateTrayMenu } from './trayManager';
 import { isAutoLaunched, getAutoLaunchEnabled, setAutoLaunchEnabled } from './autoLaunchManager';
 import { McpStore } from './mcpStore';
-import { ScheduledTaskStore } from './scheduledTaskStore';
-import { Scheduler } from './libs/scheduler';
+import { CronJobService, PLATFORM_DELIVERY_FORMAT, extractToFromSessionKey } from './libs/cronJobService';
+import type { NotifyPlatform } from '../renderer/types/scheduledTask';
 import { downloadUpdate, installUpdate, cancelActiveDownload } from './libs/appUpdateInstaller';
 import { initLogger, getLogFilePath } from './logger';
 import { getCoworkLogPath } from './libs/coworkLogger';
@@ -525,8 +525,7 @@ let coworkEngineRouter: CoworkEngineRouter | null = null;
 let skillManager: SkillManager | null = null;
 let mcpStore: McpStore | null = null;
 let imGatewayManager: IMGatewayManager | null = null;
-let scheduledTaskStore: ScheduledTaskStore | null = null;
-let scheduler: Scheduler | null = null;
+let cronJobService: CronJobService | null = null;
 let storeInitPromise: Promise<SqliteStore> | null = null;
 let openClawEngineManager: OpenClawEngineManager | null = null;
 let openClawConfigSync: OpenClawConfigSync | null = null;
@@ -999,29 +998,37 @@ const getIMGatewayManager = () => {
   return imGatewayManager;
 };
 
-const getScheduledTaskStore = () => {
-  if (!scheduledTaskStore) {
-    const sqliteStore = getStore();
-    scheduledTaskStore = new ScheduledTaskStore(sqliteStore.getDatabase(), sqliteStore.getSaveFunction());
-  }
-  return scheduledTaskStore;
-};
-
-const getScheduler = () => {
-  if (!scheduler) {
-    scheduler = new Scheduler({
-      scheduledTaskStore: getScheduledTaskStore(),
-      coworkStore: getCoworkStore(),
-      getCoworkRuntime: getCoworkEngineRouter,
-      getIMGatewayManager: () => {
-        try { return getIMGatewayManager(); } catch { return null; }
-      },
-      getSkillsPrompt: async () => {
-        return getSkillManager().buildAutoRoutingPrompt();
+const getCronJobService = (): CronJobService => {
+  if (!cronJobService) {
+    if (!openClawRuntimeAdapter) {
+      throw new Error('OpenClaw runtime adapter not initialized. CronJobService requires OpenClaw.');
+    }
+    const adapter = openClawRuntimeAdapter;
+    cronJobService = new CronJobService({
+      getGatewayClient: () => adapter.getGatewayClient(),
+      ensureGatewayReady: () => adapter.ensureReady(),
+      getDeliveryTarget: (platform) => {
+        try {
+          const manager = getIMGatewayManager();
+          const config = manager?.getConfig();
+          if (!config) return undefined;
+          const fmt = PLATFORM_DELIVERY_FORMAT[platform];
+          if (!fmt) return undefined;
+          // Prefer DM (private chat) over group for scheduled task notifications
+          const platConfig = config[platform as keyof typeof config] as unknown as Record<string, unknown> | undefined;
+          if (!platConfig) return undefined;
+          const allowFrom = platConfig.allowFrom as string[] | undefined;
+          if (allowFrom?.length) return fmt.dmFormat(allowFrom[0]);
+          const groupAllowFrom = platConfig.groupAllowFrom as string[] | undefined;
+          if (groupAllowFrom?.length && fmt.groupFormat) return fmt.groupFormat(groupAllowFrom[0]);
+          return undefined;
+        } catch {
+          return undefined;
+        }
       },
     });
   }
-  return scheduler;
+  return cronJobService;
 };
 
 // 获取正确的预加载脚本路径
@@ -2113,11 +2120,11 @@ if (!gotTheLock) {
     }
   });
 
-  // ==================== Scheduled Task IPC Handlers ====================
+  // ==================== Scheduled Task IPC Handlers (OpenClaw) ====================
 
   ipcMain.handle('scheduledTask:list', async () => {
     try {
-      const tasks = getScheduledTaskStore().listTasks();
+      const tasks = await getCronJobService().listJobs();
       return { success: true, tasks };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to list tasks' };
@@ -2126,7 +2133,7 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:get', async (_event, id: string) => {
     try {
-      const task = getScheduledTaskStore().getTask(id);
+      const task = await getCronJobService().getJob(id);
       return { success: true, task };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to get task' };
@@ -2142,8 +2149,7 @@ if (!gotTheLock) {
         : coworkConfig.workingDirectory;
       normalizedInput.workingDirectory = resolveExistingTaskWorkingDirectory(candidateWorkingDirectory);
 
-      const task = getScheduledTaskStore().createTask(normalizedInput);
-      getScheduler().reschedule();
+      const task = await getCronJobService().addJob(normalizedInput);
       return { success: true, task };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to create task' };
@@ -2152,21 +2158,14 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:update', async (_event, id: string, input: any) => {
     try {
-      const scheduledTaskStore = getScheduledTaskStore();
-      const existingTask = scheduledTaskStore.getTask(id);
-      if (!existingTask) {
-        return { success: false, error: `Task not found: ${id}` };
-      }
-
       const coworkConfig = getCoworkStore().getConfig();
       const normalizedInput = input && typeof input === 'object' ? { ...input } : {};
-      const candidateWorkingDirectory = typeof normalizedInput.workingDirectory === 'string'
-        ? (normalizedInput.workingDirectory.trim() || existingTask.workingDirectory || coworkConfig.workingDirectory)
-        : (existingTask.workingDirectory || coworkConfig.workingDirectory);
-      normalizedInput.workingDirectory = resolveExistingTaskWorkingDirectory(candidateWorkingDirectory);
+      if (typeof normalizedInput.workingDirectory === 'string') {
+        const candidateWorkingDirectory = normalizedInput.workingDirectory.trim() || coworkConfig.workingDirectory;
+        normalizedInput.workingDirectory = resolveExistingTaskWorkingDirectory(candidateWorkingDirectory);
+      }
 
-      const task = scheduledTaskStore.updateTask(id, normalizedInput);
-      getScheduler().reschedule();
+      const task = await getCronJobService().updateJob(id, normalizedInput);
       return { success: true, task };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to update task' };
@@ -2175,10 +2174,8 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:delete', async (_event, id: string) => {
     try {
-      getScheduler().stopTask(id);
-      const result = getScheduledTaskStore().deleteTask(id);
-      getScheduler().reschedule();
-      return { success: true, result };
+      await getCronJobService().removeJob(id);
+      return { success: true, result: true };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to delete task' };
     }
@@ -2186,8 +2183,8 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:toggle', async (_event, id: string, enabled: boolean) => {
     try {
-      const { task, warning } = getScheduledTaskStore().toggleTask(id, enabled);
-      getScheduler().reschedule();
+      const { warning } = await getCronJobService().toggleJob(id, enabled);
+      const task = await getCronJobService().getJob(id);
       return { success: true, task, warning };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to toggle task' };
@@ -2196,19 +2193,20 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:runManually', async (_event, id: string) => {
     try {
-      getScheduler().runManually(id).catch((err) => {
-        console.error(`[IPC] Manual run failed for ${id}:`, err);
-      });
+      await getCronJobService().runJob(id);
       return { success: true };
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to run task' };
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[IPC] Manual run failed for ${id}:`, msg);
+      return { success: false, error: msg };
     }
   });
 
   ipcMain.handle('scheduledTask:stop', async (_event, id: string) => {
     try {
-      const result = getScheduler().stopTask(id);
-      return { success: true, result };
+      // OpenClaw doesn't expose a direct stop API for running cron jobs
+      // The job will complete or timeout on its own
+      return { success: true, result: false };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to stop task' };
     }
@@ -2216,7 +2214,7 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:listRuns', async (_event, taskId: string, limit?: number, offset?: number) => {
     try {
-      const runs = getScheduledTaskStore().listRuns(taskId, limit, offset);
+      const runs = await getCronJobService().listRuns(taskId, limit, offset);
       return { success: true, runs };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to list runs' };
@@ -2225,7 +2223,7 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:countRuns', async (_event, taskId: string) => {
     try {
-      const count = getScheduledTaskStore().countRuns(taskId);
+      const count = await getCronJobService().countRuns(taskId);
       return { success: true, count };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to count runs' };
@@ -2234,10 +2232,113 @@ if (!gotTheLock) {
 
   ipcMain.handle('scheduledTask:listAllRuns', async (_event, limit?: number, offset?: number) => {
     try {
-      const runs = getScheduledTaskStore().listAllRuns(limit, offset);
+      const runs = await getCronJobService().listAllRuns(limit, offset);
       return { success: true, runs };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to list all runs' };
+    }
+  });
+
+  ipcMain.handle('scheduledTask:resolveSession', async (_event, sessionKey: string) => {
+    try {
+      if (!sessionKey) return { success: true, session: null };
+      // Fetch session history from OpenClaw (returns transient session, not persisted)
+      const session = await openClawRuntimeAdapter?.fetchSessionByKey(sessionKey);
+      return { success: true, session: session ?? null };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to resolve session' };
+    }
+  });
+
+  ipcMain.handle('scheduledTask:listDeliveryTargets', async (_event, platform: string) => {
+    try {
+      const targets: Array<{ value: string; label: string; source: string }> = [];
+      const seen = new Set<string>();
+      const fmt = PLATFORM_DELIVERY_FORMAT[platform as keyof typeof PLATFORM_DELIVERY_FORMAT];
+      if (!fmt) return { success: true, targets: [] };
+
+      const addTarget = (value: string, label: string, source: string) => {
+        if (!seen.has(value)) {
+          seen.add(value);
+          targets.push({ value, label, source });
+        }
+      };
+
+      // Source 0: Rule-extracted targets from active sessions (placed first)
+      const extractedIds = new Set<string>();
+      try {
+        const adapter = openClawRuntimeAdapter;
+        const client = adapter?.getGatewayClient();
+        if (client) {
+          const result = await client.request<{ sessions: Array<Record<string, unknown>> }>('sessions.list', {
+            activeMinutes: 1440, // last 24 hours
+            limit: 100,
+          });
+          const sessions = result?.sessions;
+          if (Array.isArray(sessions)) {
+            for (const session of sessions) {
+              const key = typeof session?.key === 'string' ? session.key : '';
+              if (!key) continue;
+              const parsed = parseChannelSessionKey(key);
+              if (!parsed || parsed.platform !== platform) continue;
+              const extractedId = extractToFromSessionKey(platform as NotifyPlatform, key);
+              if (extractedId) {
+                extractedIds.add(extractedId);
+                addTarget(extractedId, extractedId, 'extracted');
+              }
+            }
+          }
+        }
+      } catch { /* gateway not available */ }
+
+      // Source 1: IM gateway config (allowFrom / groupAllowFrom)
+      try {
+        const manager = getIMGatewayManager();
+        const config = manager?.getConfig();
+        if (config) {
+          const platConfig = config[platform as keyof typeof config] as unknown as Record<string, unknown> | undefined;
+          if (platConfig) {
+            const allowFrom = platConfig.allowFrom as string[] | undefined;
+            if (Array.isArray(allowFrom)) {
+              for (const id of allowFrom) {
+                if (id) addTarget(fmt.dmFormat(id), `DM ${id}`, 'config');
+              }
+            }
+            const groupAllowFrom = platConfig.groupAllowFrom as string[] | undefined;
+            if (Array.isArray(groupAllowFrom) && fmt.groupFormat) {
+              for (const id of groupAllowFrom) {
+                if (id) addTarget(fmt.groupFormat(id), `Group ${id}`, 'config');
+              }
+            }
+          }
+        }
+      } catch { /* IM gateway not available */ }
+
+      // Source 2: IM session mappings (historical conversations)
+      try {
+        const imStore = getIMGatewayManager()?.getIMStore();
+        if (imStore) {
+          // Map NotifyPlatform to IMPlatform (they align except naming)
+          const imPlatform = platform as IMPlatform;
+          const mappings = imStore.listSessionMappings(imPlatform);
+          for (const mapping of mappings) {
+            const id = mapping.imConversationId;
+            if (id) {
+              // Extract to-field from conversationId using platform rules
+              const extractedId = extractToFromSessionKey(platform as NotifyPlatform, id);
+              if (extractedId) {
+                addTarget(extractedId, extractedId, 'extracted');
+              }
+              // Also add full delivery address as session target
+              addTarget(fmt.dmFormat(id), `${id}`, 'session');
+            }
+          }
+        }
+      } catch { /* IM store not available */ }
+
+      return { success: true, targets };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to list delivery targets' };
     }
   });
 
@@ -3038,8 +3139,66 @@ if (!gotTheLock) {
       // 窗口就绪后创建系统托盘
       createTray(() => mainWindow, getStore());
 
-      // Start the scheduler
-      getScheduler().start();
+      // Start the cron job polling (replaces old scheduler)
+      (async () => {
+        try {
+          // Migrate existing scheduled tasks from SQLite to OpenClaw (one-time)
+          const kvStore = getStore();
+          const migrationDone = kvStore.get('cron_migration_done');
+          if (!migrationDone) {
+            try {
+              const db = kvStore.getDatabase();
+              // Check if old scheduled_tasks table exists
+              const tableCheck = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_tasks'");
+              if (tableCheck.length > 0 && tableCheck[0].values.length > 0) {
+                const rows = db.exec('SELECT name, description, schedule_json, prompt, working_directory, system_prompt, execution_mode, expires_at, notify_platforms_json, enabled FROM scheduled_tasks');
+                if (rows.length > 0 && rows[0].values.length > 0) {
+                  console.log(`[Main] Migrating ${rows[0].values.length} scheduled tasks to OpenClaw...`);
+                  const tasksForMigration = rows[0].values.map((row: unknown[]) => ({
+                    name: String(row[0] || ''),
+                    description: String(row[1] || ''),
+                    schedule: JSON.parse(String(row[2] || '{}')),
+                    prompt: String(row[3] || ''),
+                    workingDirectory: String(row[4] || ''),
+                    systemPrompt: String(row[5] || ''),
+                    executionMode: (String(row[6] || 'auto')) as 'auto' | 'local' | 'sandbox',
+                    expiresAt: row[7] ? String(row[7]) : null,
+                    notifyPlatforms: JSON.parse(String(row[8] || '[]')),
+                    enabled: row[9] === 1,
+                  }));
+                  const result = await getCronJobService().migrateFromLegacy(tasksForMigration);
+                  console.log(`[Main] Migration complete: ${result.migrated} migrated, ${result.failed} failed`);
+              }
+            }
+            kvStore.set('cron_migration_done', 'true');
+          } catch (migErr) {
+            console.error('[Main] Failed to migrate scheduled tasks:', migErr);
+          }
+        }
+
+        // One-time cleanup: remove cron job sessions from sidebar
+        if (!kvStore.get('cron_sessions_cleanup_done')) {
+          try {
+            const store = getCoworkStore();
+            const cronSessions = store.listSessions().filter(
+              (s) => s.title.startsWith('[Cron] ')
+            );
+            if (cronSessions.length > 0) {
+              store.deleteSessions(cronSessions.map((s) => s.id));
+              console.log(`[Main] Cleaned up ${cronSessions.length} cron job sessions from sidebar`);
+            }
+          } catch (cleanErr) {
+            console.error('[Main] Failed to clean up cron sessions:', cleanErr);
+          }
+          kvStore.set('cron_sessions_cleanup_done', 'true');
+        }
+
+        // Start polling after migration completes
+        getCronJobService().startPolling();
+      } catch (err) {
+        console.warn('[Main] CronJobService not available yet, will start polling when OpenClaw is ready:', err);
+      }
+      })();
     });
   };
 
@@ -3078,9 +3237,9 @@ if (!gotTheLock) {
       });
     }
 
-    // Stop the scheduler
-    if (scheduler) {
-      scheduler.stop();
+    // Stop the cron job polling
+    if (cronJobService) {
+      cronJobService.stopPolling();
     }
   };
 
@@ -3223,7 +3382,7 @@ if (!gotTheLock) {
     });
 
     // Inject scheduled task dependencies into the proxy server
-    setScheduledTaskDeps({ getScheduledTaskStore, getScheduler });
+    setScheduledTaskDeps({ getCronJobService });
 
     // 设置安全策略
     setContentSecurityPolicy();

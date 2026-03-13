@@ -172,6 +172,11 @@ export class OpenClawConfigSync {
       session: {
         dmScope: 'per-channel-peer',
       },
+      cron: {
+        enabled: true,
+        maxConcurrentRuns: 3,
+        sessionRetention: '7d',
+      },
       ...(preinstalledPluginIds.length > 0
         ? {
             plugins: {
